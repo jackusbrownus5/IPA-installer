@@ -2,7 +2,7 @@ import os
 import tempfile
 import zipfile
 import plistlib
-from flask import Flask, request, render_template, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 import threading
 import time
 
@@ -12,15 +12,23 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024  # 300 MB
 
-BASE_URL = os.environ.get("BASE_URL", "https://your-app.onrender.com")
+# Set your public Render URL here
+BASE_URL = os.environ.get("BASE_URL", "https://ipa-installer.onrender.com")
 
+
+# Extract Info.plist from IPA
 def extract_info_plist(ipa_path):
-    with zipfile.ZipFile(ipa_path, 'r') as z:
-        for name in z.namelist():
-            if name.startswith('Payload/') and name.endswith('.app/Info.plist'):
-                return plistlib.loads(z.read(name))
+    try:
+        with zipfile.ZipFile(ipa_path, 'r') as z:
+            for name in z.namelist():
+                if name.startswith('Payload/') and name.endswith('.app/Info.plist'):
+                    return plistlib.loads(z.read(name))
+    except Exception as e:
+        print("Error reading IPA:", e)
     return None
 
+
+# Create manifest plist for iOS install
 def create_manifest(plist_info, ipa_url):
     bundle_id = plist_info.get('CFBundleIdentifier', 'com.example.unknown')
     version = plist_info.get('CFBundleShortVersionString') or plist_info.get('CFBundleVersion', '1.0')
@@ -38,6 +46,8 @@ def create_manifest(plist_info, ipa_url):
     }
     return plistlib.dumps(manifest)
 
+
+# Delete files after delay
 def schedule_delete(*paths, delay=300):
     def delete_files():
         time.sleep(delay)
@@ -48,17 +58,19 @@ def schedule_delete(*paths, delay=300):
                 pass
     threading.Thread(target=delete_files, daemon=True).start()
 
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return "IPA Installer Backend is running. Use POST /upload"
+
 
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'ipa' not in request.files:
-        return render_template('index.html', error="No IPA selected")
+        return jsonify({"error": "No IPA selected"}), 400
     f = request.files['ipa']
     if not f.filename.lower().endswith('.ipa'):
-        return render_template('index.html', error="File must be .ipa")
+        return jsonify({"error": "File must be .ipa"}), 400
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.ipa')
     os.close(tmp_fd)
@@ -67,7 +79,7 @@ def upload():
     info = extract_info_plist(tmp_path)
     if not info:
         os.remove(tmp_path)
-        return render_template('index.html', error="Info.plist not found")
+        return jsonify({"error": "Info.plist not found"}), 400
 
     ipa_name = f"{info.get('CFBundleIdentifier','app')}-{info.get('CFBundleVersion','1.0')}.ipa"
     ipa_path = os.path.join(UPLOAD_DIR, ipa_name)
@@ -75,7 +87,7 @@ def upload():
 
     ipa_url = f"{BASE_URL}/files/{ipa_name}"
     manifest_bytes = create_manifest(info, ipa_url)
-    manifest_name = ipa_name.replace('.ipa','.plist')
+    manifest_name = ipa_name.replace('.ipa', '.plist')
     manifest_path = os.path.join(UPLOAD_DIR, manifest_name)
     with open(manifest_path, 'wb') as m:
         m.write(manifest_bytes)
@@ -84,12 +96,16 @@ def upload():
 
     schedule_delete(ipa_path, manifest_path, delay=300)
 
-    return render_template('result.html', title=info.get('CFBundleDisplayName') or info.get('CFBundleName'),
-                           install_link=install_link)
+    return jsonify({
+        "title": info.get('CFBundleDisplayName') or info.get('CFBundleName'),
+        "install_link": install_link
+    })
+
 
 @app.route('/files/<path:filename>')
 def serve_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
